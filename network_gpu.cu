@@ -210,6 +210,12 @@ void relu(float *x, int size) {
     }
 }
 
+__global__ void reluKernel(float* x, int size) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < size) {
+      x[idx] = fmaxf(0.0f, x[idx]);
+  }
+}
 
 void forwardLayer(float *input, float *weights, float *bias, float *output, int input_size,
                    int output_size, int batch_size, bool use_relu) { 
@@ -476,18 +482,18 @@ int main(int argc, char **argv) {
     // Testing
     test(&nn, X_test, y_test);
 
-    free(nn.weights_input_hidden1);
-    free(nn.weights_hidden1_hidden2);
-    free(nn.weights_hidden2_output);
-    free(nn.bias_hidden1);
-    free(nn.bias_hidden2);
-    free(nn.bias_output);
-    free(nn.grad_weights_input_hidden1);
-    free(nn.grad_weights_hidden1_hidden2);
-    free(nn.grad_weights_hidden2_output);
-    free(nn.grad_bias_hidden1);
-    free(nn.grad_bias_hidden2);
-    free(nn.grad_bias_output);
+    CHECK(cudaFree(nn.weights_input_hidden1));
+    CHECK(cudaFree(nn.weights_hidden1_hidden2));
+    CHECK(cudaFree(nn.weights_hidden2_output));
+    CHECK(cudaFree(nn.bias_hidden1));
+    CHECK(cudaFree(nn.bias_hidden2));
+    CHECK(cudaFree(nn.bias_output));
+    CHECK(cudaFree(nn.grad_weights_input_hidden1));
+    CHECK(cudaFree(nn.grad_weights_hidden1_hidden2));
+    CHECK(cudaFree(nn.grad_weights_hidden2_output));
+    CHECK(cudaFree(nn.grad_bias_hidden1));
+    CHECK(cudaFree(nn.grad_bias_hidden2));
+    CHECK(cudaFree(nn.grad_bias_output));
     free(X_train);
     free(y_train);
 
