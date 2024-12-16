@@ -94,25 +94,45 @@ void initialize_bias(float *bias, int size) {
 }
 
 void initialize_neural_network(NeuralNetwork *nn) {
-    nn->weights_input_hidden1 = (float *)malloc(HIDDEN1_SIZE * INPUT_SIZE * sizeof(float));
-    nn->weights_hidden1_hidden2 = (float *)malloc(HIDDEN2_SIZE * HIDDEN1_SIZE * sizeof(float));
-    nn->weights_hidden2_output = (float *)malloc(OUTPUT_SIZE * HIDDEN2_SIZE * sizeof(float));
-    nn->bias_hidden1 =(float *) malloc(HIDDEN1_SIZE * sizeof(float));
-    nn->bias_hidden2 = (float *)malloc(HIDDEN2_SIZE * sizeof(float));
-    nn->bias_output = (float *)malloc(OUTPUT_SIZE * sizeof(float));
-    nn->grad_weights_input_hidden1 = (float *)malloc(HIDDEN1_SIZE * INPUT_SIZE * sizeof(float));
-    nn->grad_weights_hidden1_hidden2 = (float *)malloc(HIDDEN2_SIZE * HIDDEN1_SIZE * sizeof(float));
-    nn->grad_weights_hidden2_output = (float *)malloc(OUTPUT_SIZE * HIDDEN2_SIZE * sizeof(float));
-    nn->grad_bias_hidden1 = (float *)malloc(HIDDEN1_SIZE * sizeof(float));
-    nn->grad_bias_hidden2 = (float *)malloc(HIDDEN2_SIZE * sizeof(float));
-    nn->grad_bias_output = (float *)malloc(OUTPUT_SIZE * sizeof(float));
+   // Allocate device memory
+    float *d_weights[] = {&nn->weights_input_hidden1, &nn->weights_hidden1_hidden2, &nn->weights_hidden2_output};
+    float *d_biases[] = {&nn->bias_hidden1, &nn->bias_hidden2, &nn->bias_output};
+    float *d_grad_weights[] = {&nn->grad_weights_input_hidden1, &nn->grad_weights_hidden1_hidden2, &nn->grad_weights_hidden2_output};
+    float *d_grad_biases[] = {&nn->grad_bias_hidden1, &nn->grad_bias_hidden2, &nn->grad_bias_output};
+    int sizes[] = {HIDDEN1_SIZE * INPUT_SIZE, HIDDEN2_SIZE * HIDDEN1_SIZE, OUTPUT_SIZE * HIDDEN2_SIZE};
+    int bias_sizes[] = {HIDDEN1_SIZE, HIDDEN2_SIZE, OUTPUT_SIZE};
 
-    initialize_weights(nn->weights_input_hidden1, HIDDEN1_SIZE * INPUT_SIZE);
-    initialize_weights(nn->weights_hidden1_hidden2, HIDDEN2_SIZE * HIDDEN1_SIZE);
-    initialize_weights(nn->weights_hidden2_output, OUTPUT_SIZE * HIDDEN2_SIZE);
-    initialize_bias(nn->bias_hidden1, HIDDEN1_SIZE);
-    initialize_bias(nn->bias_hidden2, HIDDEN2_SIZE);
-    initialize_bias(nn->bias_output, OUTPUT_SIZE);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(cudaMalloc(d_weights[i], sizes[i] * sizeof(float)));
+        CHECK(cudaMalloc(d_biases[i], bias_sizes[i] * sizeof(float)));
+        CHECK(cudaMalloc(d_grad_weights[i], sizes[i] * sizeof(float)));
+        CHECK(cudaMalloc(d_grad_biases[i], bias_sizes[i] * sizeof(float)));
+    }
+
+    // Allocate temporary host memory
+    float *h_weights[3], *h_biases[3];
+    for (int i = 0; i < 3; ++i) {
+        h_weights[i] = (float *)malloc(sizes[i] * sizeof(float));
+        h_biases[i] = (float *)malloc(bias_sizes[i] * sizeof(float));
+    }
+
+    // Initialize weights and biases on the host
+    for (int i = 0; i < 3; ++i) {
+        initialize_weights(h_weights[i], sizes[i]);
+        initialize_bias(h_biases[i], bias_sizes[i]);
+    }
+
+    // Copy initialized values to device
+    for (int i = 0; i < 3; ++i) {
+        CHECK(cudaMemcpy(*d_weights[i], h_weights[i], sizes[i] * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK(cudaMemcpy(*d_biases[i], h_biases[i], bias_sizes[i] * sizeof(float), cudaMemcpyHostToDevice));
+    }
+
+    // Free temporary host memory
+    for (int i = 0; i < 3; ++i) {
+        free(h_weights[i]);
+        free(h_biases[i]);
+    }
 }
 
 void load_data(const char *filename, float *data, int size) {
@@ -155,22 +175,34 @@ void load_labels(const char *filename, int *labels, int size) {
 
 
 
-void softmax(float *x, int batch_size, int size) {
-    for (int b = 0; b < batch_size; b++) {
-        float max_val = x[b * size];
-        for (int i = 1; i < size; i++) {
-            if (x[b * size + i] > max_val) max_val = x[b * size + i];
+__global__ void softmax_kernel(float *x, int batch_size, int size) {
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+
+    // Each thread processes one element
+    if (b < batch_size && tid < size) {
+        __shared__ float max_val;
+        __shared__ float sum;
+
+        // Find the maximum value in the batch
+        if (tid == 0) {
+            max_val = x[b * size];
+            for (int i = 1; i < size; i++) {
+                if (x[b * size + i] > max_val) max_val = x[b * size + i];
+            }
         }
-        float sum = 0.0f;
-        for (int i = 0; i < size; i++) {
-            x[b * size + i] = expf(x[b * size + i] - max_val);
-            sum += x[b * size + i];
-        }
-        for (int i = 0; i < size; i++) {
-            x[b * size + i] = fmaxf(x[b * size + i] / sum, 1e-7f);
-        }
+        __syncthreads();
+
+        // Compute the exponentials and sum them up
+        float exp_val = expf(x[b * size + tid] - max_val);
+        atomicAdd(&sum, exp_val);
+        __syncthreads();
+
+        // Compute the softmax values
+        x[b * size + tid] = fmaxf(exp_val / sum, 1e-7f);
     }
 }
+
 
 void relu(float *x, int size) {
     for (int i = 0; i < size; i++) {
