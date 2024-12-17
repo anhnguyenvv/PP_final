@@ -174,8 +174,6 @@ void load_labels(const char *filename, int *labels, int size) {
   fclose(file);
 }
 
-
-
 void softmax(float *x, int batch_size, int size) {
   for (int b = 0; b < batch_size; b++) {
       float max_val = x[b * size];
@@ -250,7 +248,7 @@ void forwardLayer(float *input, float *weights, float *bias, float *output, int 
 }
 
 
-float calculate_loss(float *output, int *labels, int batch_size)
+float compute_loss(float *output, int *labels, int batch_size)
 {
   float total_loss = 0.0f;
   for (int b = 0; b < batch_size; b++) {
@@ -259,275 +257,209 @@ float calculate_loss(float *output, int *labels, int batch_size)
   }
   return total_loss / batch_size;
 };
-
-// Hàm tính đạo hàm của ReLU
-void relu_derivative(float *x, int size, float *grad) {
-  for (int i = 0; i < size; i++) {
-      grad[i] *= (x[i] > 0.0f) ? 1.0f : 0.0f;
-  }
-}
-__global__ void compute_delta_relu_kernel(float *relu_del_out, float *weights, float *input_layer, float *relu_del, int batch_size, int output_size, int input_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx < batch_size * input_size) {
-        int i = idx / input_size;
-        int j = idx % input_size;
-        
-        relu_del[idx] = 0.0f;
-        for (int k = 0; k < output_size; k++) {
-            relu_del[idx] += relu_del_out[i * output_size + k] * weights[j * output_size + k];
-        }
-
-        relu_del[idx] *= (input_layer[idx] > 0.0f);
+// Helper function to compute gradients for weights and biases
+void compute_gradients(float *input, float *delta, float *grad_weights, 
+                       float *grad_bias, int batch_size, int input_size, int output_size) {
+    // Compute weight gradients
+    for (int b = 0; b < batch_size; b++) {
+        for (int j = 0; j < output_size; j++) {
+          for (int i = 0; i < input_size; i++) {
+            grad_weights[i * output_size + j] += input[b * input_size + i] * delta[b * output_size + j];
+          }
+          grad_bias[j] += delta[b * output_size + j];
+        }        
     }
 }
-void compute_delta_relu(float *relu_del_out, float *weights, float *input_layer, float *relu_del, 
-                        int batch_size, int output_size, int input_size) {
-  for (int i = 0; i < batch_size; i++) {
-      for (int j = 0; j < input_size; j++) {
-        int idx = i * input_size + j;
-        relu_del[idx]  = 0.0f;
-        for (int k = 0; k < output_size; k++) {
-            relu_del[idx] += relu_del_out[i * output_size + k] * weights[j* output_size + k];
-        }
-        //  tính đạo hàm của ReLU
 
-        relu_del[idx] *= (input_layer[idx] > 0.0f);
-      }
-  }
-}
-//  function to compute gradients for weights and biases
-void compute_gradients(float *input, float *grad_output, float *grad_weights, 
-                       float *grad_bias, int batch_size, int input_size, int output_size) {
-  // Compute weight gradients
-  for (int b = 0; b < batch_size; b++) {
-      for (int j = 0; j < output_size; j++) {
-        for (int i = 0; i < input_size; i++) {
-          grad_weights[i * output_size + j] += input[b * input_size + i] * grad_output[b * output_size + j];
+void compute_delta_relu(float *relu_del_next, float *weights, float *input_layer, float *relu_del, 
+                        int batch_size, int next_size, int input_size) {
+    for (int i = 0; i < batch_size; i++) {
+        for (int j = 0; j < input_size; j++) {
+          int idx = i * input_size + j;
+          relu_del[idx]  = 0.0f;
+          // Tính tổng các delta từ lớp sau truyền về
+          for (int k = 0; k < next_size; k++) {
+              relu_del[idx] += relu_del_next[i * next_size + k] * weights[j* next_size + k];
+          }
+          //  tính đạo hàm của ReLU
+          relu_del[idx] *= (input_layer[idx] > 0.0f);
         }
-        grad_bias[j] += grad_output[b * output_size + j];
-      }        
-  }
+    }
 }
 
 // Hàm cập nhật trọng số và bias
 void update_weights(float * weights, float * grad_weights, float * bias, float * grad_bias, int output_size, int input_size) {
-  // Cập nhật trọng số và bias
-  for (int i = 0; i < input_size * output_size; i++) {
-      weights[i] -= LEARNING_RATE *grad_weights[i];
-  }
-  for (int i = 0; i < output_size; i++) {
-      bias[i] -= LEARNING_RATE * grad_bias[i];
-  }
-}
-
-__global__ void forwardLayerKernel(float *input, float *weights, float *bias, float *output, int input_size, int output_size, int batch_size, bool use_relu) {
-    int batch = blockIdx.x;
-    int neuron = threadIdx.x;
-
-    if (neuron < output_size && batch < batch_size) {
-        float sum = 0.0f;
-
-        for (int i = 0; i < input_size; ++i) {
-            sum += input[batch * input_size + i] * weights[i * output_size + neuron];
-        }
-
-        output[batch * output_size + neuron] = sum + bias[neuron];
-        if (use_relu) {
-            output[batch * output_size + neuron] = fmaxf(0.0f, output[batch * output_size + neuron]);
-        }
+    // Cập nhật trọng số và bias
+    for (int i = 0; i < input_size * output_size; i++) {
+        weights[i] -= LEARNING_RATE *grad_weights[i];
+    }
+    for (int i = 0; i < output_size; i++) {
+        bias[i] -= LEARNING_RATE * grad_bias[i];
     }
 }
 
-__global__ void compute_gradients_kernel(float *input, float *grad_output, float *grad_weights, float *grad_bias, int batch_size, int input_size, int output_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx < input_size * output_size) {
-        int i = idx / output_size;
-        int j = idx % output_size;
-
-        float grad_weight = 0.0f;
-        for (int b = 0; b < batch_size; ++b) {
-            grad_weight += input[b * input_size + i] * grad_output[b * output_size + j];
-        }
-        grad_weights[idx] = grad_weight;
-
-        if (i == 0) {
-            float grad_bias_val = 0.0f;
-            for (int b = 0; b < batch_size; ++b) {
-                grad_bias_val += grad_output[b * output_size + j];
+int checkPredictions(float *output, int *y_test, int start_idx, int batch_size, int output_size) {
+    int correct = 0;
+    for (int i = 0; i < batch_size; i++) {              
+        int predicted = 0;
+        // Tìm lớp có xác suất cao nhất
+        for (int j = 1; j < output_size; j++) {
+            if (output[i * output_size + j] > output[i * output_size + predicted]) {
+                predicted = j;
             }
-            grad_bias[j] = grad_bias_val;
+        }
+        // So sánh với nhãn thực tế
+        if (predicted == y_test[start_idx + i]) {
+            correct++;
         }
     }
+    return correct;
 }
-
-__global__ void update_weights_kernel(float *weights, float *grad_weights, float *bias, float *grad_bias, int output_size, int input_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx < input_size * output_size) {
-        weights[idx] -= LEARNING_RATE * grad_weights[idx];
-    }
-
-    if (idx < output_size) {
-        bias[idx] -= LEARNING_RATE * grad_bias[idx];
-    }
-}
-
 void train(NeuralNetwork *nn, float *X_train, int *y_train) {
-    float *d_X_train, *d_hidden1, *d_hidden2, *d_output, *d_del_output, *d_d_ReLU_out2, *d_d_ReLU_out1;
-    int *d_y_train;
     float *hidden1 = (float *)malloc(BATCH_SIZE * HIDDEN1_SIZE * sizeof(float));
     float *hidden2 = (float *)malloc(BATCH_SIZE * HIDDEN2_SIZE * sizeof(float));
     float *output = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
-
-    CHECK(cudaMalloc(&d_X_train, TRAIN_DATA_SIZE * INPUT_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_hidden1, BATCH_SIZE * HIDDEN1_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_hidden2, BATCH_SIZE * HIDDEN2_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_del_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_d_ReLU_out2, BATCH_SIZE * HIDDEN2_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_d_ReLU_out1, BATCH_SIZE * HIDDEN1_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_y_train, TRAIN_DATA_SIZE * sizeof(int)));
-
-    CHECK(cudaMemcpy(d_X_train, X_train, TRAIN_DATA_SIZE * INPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_y_train, y_train, TRAIN_DATA_SIZE * sizeof(int), cudaMemcpyHostToDevice));
 
     int num_batches = TRAIN_DATA_SIZE / BATCH_SIZE;
 
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         float total_loss = 0.0f;
         int correct = 0;
-
+        double layer1_time = 0.0, layer2_time = 0.0, output_time = 0.0;
         for (int batch = 0; batch < num_batches; batch++) {
             int start_idx = batch * BATCH_SIZE;
 
             // Forward pass for layer 1
-            forwardLayerKernel<<<BATCH_SIZE, HIDDEN1_SIZE>>>(d_X_train + start_idx * INPUT_SIZE, nn->weights_input_hidden1, nn->bias_hidden1, d_hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
+            clock_t start = clock();
+            forwardLayer(&X_train[start_idx * INPUT_SIZE], nn->weights_input_hidden1, nn->bias_hidden1, hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
+            clock_t end = clock();
+            layer1_time += (double)(end - start) / CLOCKS_PER_SEC;
 
             // Forward pass for layer 2
-            forwardLayerKernel<<<BATCH_SIZE, HIDDEN2_SIZE>>>(d_hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, d_hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
+            start = clock();
+            forwardLayer(hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
+            end = clock();
+            layer2_time += (double)(end - start) / CLOCKS_PER_SEC;
 
-            // Forward pass for output layer
-            forwardLayerKernel<<<BATCH_SIZE, OUTPUT_SIZE>>>(d_hidden2, nn->weights_hidden2_output, nn->bias_output, d_output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
-
-            // Apply softmax
-            softmax_kernel<<<BATCH_SIZE, OUTPUT_SIZE>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
-
-            CHECK(cudaMemcpy(output, d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
-
-            float loss = calculate_loss(output, &y_train[start_idx], BATCH_SIZE);
+            // Forward pass for output layer (no ReLU on output layer)
+            start = clock();
+            forwardLayer(hidden2, nn->weights_hidden2_output, nn->bias_output, output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
+            
+            // Apply softmax to output
+            softmax(output, BATCH_SIZE, OUTPUT_SIZE);
+            end = clock();
+            output_time += (double)(end - start) / CLOCKS_PER_SEC;
+            
+            float loss = compute_loss(output, &y_train[start_idx], BATCH_SIZE);
             total_loss += loss;
 
-            for (int i = 0; i < BATCH_SIZE; i++) {
-                int predicted = 0;
-                for (int j = 1; j < OUTPUT_SIZE; j++) {
-                    if (output[i * OUTPUT_SIZE + j] > output[i * OUTPUT_SIZE + predicted]) {
-                        predicted = j;
-                    }
-                }
-                if (predicted == y_train[start_idx + i]) {
-                    correct++;
-                }
-            }
+            // Check prediction accuracy
+            correct += checkPredictions(output, y_train, start_idx, BATCH_SIZE, OUTPUT_SIZE);
 
             // Backpropagation
-            CHECK(cudaMemset(nn->grad_weights_input_hidden1, 0, HIDDEN1_SIZE * INPUT_SIZE * sizeof(float)));
-            CHECK(cudaMemset(nn->grad_weights_hidden1_hidden2, 0, HIDDEN2_SIZE * HIDDEN1_SIZE * sizeof(float)));
-            CHECK(cudaMemset(nn->grad_weights_hidden2_output, 0, OUTPUT_SIZE * HIDDEN2_SIZE * sizeof(float)));
-            CHECK(cudaMemset(nn->grad_bias_hidden1, 0, HIDDEN1_SIZE * sizeof(float)));
-            CHECK(cudaMemset(nn->grad_bias_hidden2, 0, HIDDEN2_SIZE * sizeof(float)));
-            CHECK(cudaMemset(nn->grad_bias_output, 0, OUTPUT_SIZE * sizeof(float)));
+            memset(nn->grad_weights_input_hidden1, 0, HIDDEN1_SIZE * INPUT_SIZE * sizeof(float));
+            memset(nn->grad_weights_hidden1_hidden2, 0, HIDDEN2_SIZE * HIDDEN1_SIZE * sizeof(float));
+            memset(nn->grad_weights_hidden2_output, 0, OUTPUT_SIZE * HIDDEN2_SIZE * sizeof(float));
+            memset(nn->grad_bias_hidden1, 0, HIDDEN1_SIZE * sizeof(float));
+            memset(nn->grad_bias_hidden2, 0, HIDDEN2_SIZE * sizeof(float));
+            memset(nn->grad_bias_output, 0, OUTPUT_SIZE * sizeof(float));
 
+            start = clock();
+            float *grad_out = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
             // Compute gradient at output layer
             for (int b = 0; b < BATCH_SIZE; b++) {
                 for (int i = 0; i < OUTPUT_SIZE; i++) {
-                    output[b * OUTPUT_SIZE + i] = output[b * OUTPUT_SIZE + i] - (i == y_train[start_idx + b] ?  1.0f : 0.0f);
+                  int idx=b * OUTPUT_SIZE + i;
+                    grad_out[idx] = output[idx] - (i == y_train[start_idx + b] ?  1.0f : 0.0f);
                 }
             }
-            CHECK(cudaMemcpy(d_del_output, output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
+            
+            // Compute gradients for weights and biases between Hidden2 -> Output
+            compute_gradients(hidden2, grad_out, nn->grad_weights_hidden2_output, nn->grad_bias_output, BATCH_SIZE, HIDDEN2_SIZE, OUTPUT_SIZE);
+            end = clock();
+            output_time += (double)(end - start) / CLOCKS_PER_SEC;
+            
+            start = clock();  
+            
+            float *d_ReLU_out2 = (float *)malloc(BATCH_SIZE * HIDDEN2_SIZE * sizeof(float));
+            compute_delta_relu(grad_out, nn->weights_hidden2_output, hidden2, d_ReLU_out2, 
+                               BATCH_SIZE, OUTPUT_SIZE, HIDDEN2_SIZE);
 
-            compute_gradients_kernel<<<(HIDDEN2_SIZE * OUTPUT_SIZE + 255) / 256, 256>>>(d_hidden2, d_del_output, nn->grad_weights_hidden2_output, nn->grad_bias_output, BATCH_SIZE, HIDDEN2_SIZE, OUTPUT_SIZE);
-
-            compute_delta_relu_kernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_del_output, nn->weights_hidden2_output, d_hidden2, d_d_ReLU_out2, BATCH_SIZE, OUTPUT_SIZE, HIDDEN2_SIZE);
-            compute_gradients_kernel<<<(HIDDEN1_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_hidden1, d_d_ReLU_out2, nn->grad_weights_hidden1_hidden2, nn->grad_bias_hidden2, BATCH_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE);
-
-            compute_delta_relu_kernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_d_ReLU_out2, nn->weights_hidden1_hidden2, d_hidden1, d_d_ReLU_out1, BATCH_SIZE, HIDDEN2_SIZE, HIDDEN1_SIZE);
-            compute_gradients_kernel<<<(INPUT_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_X_train + start_idx * INPUT_SIZE, d_d_ReLU_out1, nn->grad_weights_input_hidden1, nn->grad_bias_hidden1, BATCH_SIZE, INPUT_SIZE, HIDDEN1_SIZE);
-
-            update_weights_kernel<<<(INPUT_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(nn->weights_input_hidden1, nn->grad_weights_input_hidden1, nn->bias_hidden1, nn->grad_bias_hidden1, HIDDEN1_SIZE, INPUT_SIZE);
-            update_weights_kernel<<<(HIDDEN1_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(nn->weights_hidden1_hidden2, nn->grad_weights_hidden1_hidden2, nn->bias_hidden2, nn->grad_bias_hidden2, HIDDEN2_SIZE, HIDDEN1_SIZE);
-            update_weights_kernel<<<(HIDDEN2_SIZE * OUTPUT_SIZE + 255) / 256, 256>>>(nn->weights_hidden2_output, nn->grad_weights_hidden2_output, nn->bias_output, nn->grad_bias_output, OUTPUT_SIZE, HIDDEN2_SIZE);
+            // Compute gradients for weights and biases between Hidden1 -> Hidden2
+            compute_gradients(hidden1, d_ReLU_out2, nn->grad_weights_hidden1_hidden2, nn->grad_bias_hidden2, BATCH_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE);
+            
+            end = clock(); 
+            layer2_time += (double)(end - start) / CLOCKS_PER_SEC;
+            
+            start = clock();       
+            float *d_ReLU_out1 = (float *)malloc(BATCH_SIZE * HIDDEN1_SIZE * sizeof(float));    
+            compute_delta_relu(d_ReLU_out2, nn->weights_hidden1_hidden2, hidden1, d_ReLU_out1, 
+                               BATCH_SIZE, HIDDEN2_SIZE, HIDDEN1_SIZE);
+            
+            // Compute gradients for weights and biases between Input -> Hidden1
+            compute_gradients(&X_train[start_idx * INPUT_SIZE], d_ReLU_out1, nn->grad_weights_input_hidden1, nn->grad_bias_hidden1, BATCH_SIZE, INPUT_SIZE, HIDDEN1_SIZE);
+            end = clock();
+            layer1_time += (double)(end - start) / CLOCKS_PER_SEC;
+            update_weights(nn->weights_hidden2_output, nn->grad_weights_hidden2_output, 
+                            nn->bias_output, nn->grad_bias_output, OUTPUT_SIZE, HIDDEN2_SIZE);
+            update_weights(nn->weights_hidden1_hidden2, nn->grad_weights_hidden1_hidden2, 
+                              nn->bias_hidden2, nn->grad_bias_hidden2, HIDDEN2_SIZE, HIDDEN1_SIZE);
+            update_weights(nn->weights_input_hidden1, nn->grad_weights_input_hidden1, nn->bias_hidden1, 
+                                  nn->grad_bias_hidden1, HIDDEN1_SIZE, INPUT_SIZE);
+            // Free temporary variables
+            free(grad_out);
+            free(d_ReLU_out2);
+            free(d_ReLU_out1);            
         }
 
-        printf("Epoch %d/%d completed, Loss: %.4f, Accuracy: %.2f%%\n", epoch + 1, EPOCHS, total_loss / num_batches, 100.0f * correct / TRAIN_DATA_SIZE);
+        // Print information after each epoch
+        printf("Epoch %d/%d completed, Loss: %.4f, Accuracy: %.2f%%\n",
+               epoch + 1, EPOCHS, total_loss / num_batches, 100.0f * correct / TRAIN_DATA_SIZE);
+
+        printf("    Layer 1 time: %.6f seconds\n", layer1_time);
+        printf("    Layer 2 time: %.6f seconds\n", layer2_time);
+        printf("    Output layer time: %.6f seconds\n", output_time);
     }
 
     free(hidden1);
     free(hidden2);
     free(output);
-    CHECK(cudaFree(d_X_train));
-    CHECK(cudaFree(d_hidden1));
-    CHECK(cudaFree(d_hidden2));
-    CHECK(cudaFree(d_output));
-    CHECK(cudaFree(d_del_output));
-    CHECK(cudaFree(d_d_ReLU_out2));
-    CHECK(cudaFree(d_d_ReLU_out1));
-    CHECK(cudaFree(d_y_train));
 }
+
 void test(NeuralNetwork *nn, float *X_test, int *y_test) {
-    float *d_X_test, *d_hidden1, *d_hidden2, *d_output;
-    CHECK(cudaMalloc(&d_X_test, TEST_DATA_SIZE * INPUT_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_hidden1, BATCH_SIZE * HIDDEN1_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_hidden2, BATCH_SIZE * HIDDEN2_SIZE * sizeof(float)));
-    CHECK(cudaMalloc(&d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
-
-    CHECK(cudaMemcpy(d_X_test, X_test, TEST_DATA_SIZE * INPUT_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-
+    float *hidden1 = (float *)malloc(BATCH_SIZE * HIDDEN1_SIZE * sizeof(float));
+    float *hidden2 = (float *)malloc(BATCH_SIZE * HIDDEN2_SIZE * sizeof(float));
+    float *output = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
     int num_batches = TEST_DATA_SIZE / BATCH_SIZE;
     int correct = 0;
 
     for (int batch = 0; batch < num_batches; batch++) {
         int start_idx = batch * BATCH_SIZE;
 
-        // Forward pass for layer 1
-        forwardLayerKernel<<<BATCH_SIZE, HIDDEN1_SIZE>>>(d_X_test + start_idx * INPUT_SIZE, nn->weights_input_hidden1, nn->bias_hidden1, d_hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
+        // Forward pass cho layer 1
+        forwardLayer(&X_test[start_idx * INPUT_SIZE], nn->weights_input_hidden1, nn->bias_hidden1, hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
 
-        // Forward pass for layer 2
-        forwardLayerKernel<<<BATCH_SIZE, HIDDEN2_SIZE>>>(d_hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, d_hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
+        // Forward pass cho layer 2
+        forwardLayer(hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
 
-        // Forward pass for output layer
-        forwardLayerKernel<<<BATCH_SIZE, OUTPUT_SIZE>>>(d_hidden2, nn->weights_hidden2_output, nn->bias_output, d_output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
+        // Forward pass cho layer output (không dùng ReLU)
+        forwardLayer(hidden2, nn->weights_hidden2_output, nn->bias_output, output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
 
-        // Apply softmax
-        softmax_kernel<<<BATCH_SIZE, OUTPUT_SIZE>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
+        // Áp dụng softmax
+        softmax(output, BATCH_SIZE, OUTPUT_SIZE);
 
-        float *output = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
-        CHECK(cudaMemcpy(output, d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
-
-        // Check prediction accuracy
-        for (int i = 0; i < BATCH_SIZE; i++) {
-            int predicted = 0;
-            for (int j = 1; j < OUTPUT_SIZE; j++) {
-                if (output[i * OUTPUT_SIZE + j] > output[i * OUTPUT_SIZE + predicted]) {
-                    predicted = j;
-                }
-            }
-            if (predicted == y_test[start_idx + i]) {
-                correct++;
-            }
-        }
-        free(output);
+        // Kiểm tra kết quả dự đoán
+        correct += checkPredictions(output, y_test, start_idx, BATCH_SIZE, OUTPUT_SIZE);
     }
 
     float accuracy = 100.0f * correct / TEST_DATA_SIZE;
     printf("Test Accuracy: %.2f%%\n", accuracy);
 
-    CHECK(cudaFree(d_X_test));
-    CHECK(cudaFree(d_hidden1));
-    CHECK(cudaFree(d_hidden2));
-    CHECK(cudaFree(d_output));
+    free(hidden1);
+    free(hidden2);
+    free(output);
 }
+
 int main(int argc, char **argv) {
     srand(time(NULL));
 
