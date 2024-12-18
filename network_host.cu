@@ -30,12 +30,15 @@ typedef struct {
     float *grad_bias_output;
 } NeuralNetwork;
 
+
 void initialize_weights(float *weights, int size) {
-    float scale = sqrtf(2.0f / size);
+    float scale = sqrtf(2.0f / size); 
     for (int i = 0; i < size; i++) {
-        weights[i] = ((float)rand() / RAND_MAX) * scale - (scale / 2.0f);
+        float random = ((float)rand() / RAND_MAX) * 2.0f - 1.0f; // Uniform [-1, 1]
+        weights[i] = random * scale; // Áp dụng scale He
     }
 }
+
 
 void initialize_bias(float *bias, int size) {
     for (int i = 0; i < size; i++) {
@@ -105,17 +108,18 @@ void load_labels(const char *filename, int *labels, int size) {
 
 void softmax(float *x, int batch_size, int size) {
     for (int b = 0; b < batch_size; b++) {
-        float max_val = x[b * size];
+      int idx = b*size;
+        float max_val = x[idx];
         for (int i = 1; i < size; i++) {
-            max_val = fmaxf(max_val, x[b * size + i]);
+            max_val = fmaxf(max_val, x[idx + i]);
         }
         float sum = 0.0f;
         for (int i = 0; i < size; i++) {
-            x[b * size + i] = expf(x[b * size + i] - max_val);
-            sum += x[b * size + i];
+            x[idx + i] = expf(x[idx + i] - max_val);
+            sum += x[idx + i];
         }
         for (int i = 0; i < size; i++) {
-            x[b * size + i] = fmaxf(x[b * size + i] / sum, 1e-7f);
+            x[idx + i] = fmaxf(x[idx + i] / sum, 1e-7f);
         }
     }
 }
@@ -127,19 +131,31 @@ void relu(float *x, int size) {
 }
 
 
+void matrix_multiplication(float *A, float *B, float *C, int m, int n, int k) {
+  for (int row = 0; row < m; ++row) {
+          for (int col = 0; col < k; ++col) {
+              float value = 0;
+              for (int e = 0; e < n; ++e) {
+                  value += A[row * n + e] * B[e * k + col];
+              }
+              C[row * k + col] = value;
+          }
+      }
+}
+// Add bias
+void bias_forward(float *x, float *bias, int batch_size, int size) {
+    for (int b = 0; b < batch_size; b++) {
+        for (int i = 0; i < size; i++) {
+            x[b * size + i] += bias[i];
+        }
+    }
+}
 void forwardLayer(float *input, float *weights, float *bias, float *output, int input_size,
                    int output_size, int batch_size, bool use_relu) { 
   
-  for (int i = 0; i < batch_size; i++) { 
-    for (int j = 0; j < output_size; j++) {
-      output[i*output_size + j] = 0.0f;
-      for (int k = 0; k < input_size; k++) {
-          output[i*output_size + j] += input[i*input_size + k] * weights[k * output_size + j];
-      }
-      output[i] += bias[i]; // Cộng bias
-    }
-  }
-
+  matrix_multiplication(input, weights, output, batch_size, input_size, output_size);    
+  // Add bias1
+  bias_forward(output, bias, batch_size, output_size);
   if (use_relu) {
       relu(output, batch_size*output_size); 
   }
@@ -196,7 +212,7 @@ void update_weights(float * weights, float * grad_weights, float * bias, float *
     }
 }
 
-int checkPredictions(float *output, int *y_test, int start_idx, int batch_size, int output_size) {
+int checkPredictions(float *output, int *labels, int batch_size, int output_size) {
     int correct = 0;
     for (int i = 0; i < batch_size; i++) {              
         int predicted = 0;
@@ -206,13 +222,22 @@ int checkPredictions(float *output, int *y_test, int start_idx, int batch_size, 
                 predicted = j;
             }
         }
-        // So sánh với nhãn thực tế
-        if (predicted == y_test[start_idx + i]) {
+        if (predicted == labels[i]) {
             correct++;
         }
     }
     return correct;
 }
+
+// Hàm tính toán gradient tại lớp đầu ra
+void compute_output_gradient(float* grad_output, float* output, int* labels, int batch_size, int output_size) {
+    for (int b = 0; b < batch_size; b++) {
+        for (int i = 0; i < output_size; i++) {
+            grad_output[b * output_size + i] = output[b * output_size + i] - (i == labels[b] ? 1.0f : 0.0f);
+        }
+    }
+}
+
 void train(NeuralNetwork *nn, float *X_train, int *y_train) {
     float *hidden1 = (float *)malloc(BATCH_SIZE * HIDDEN1_SIZE * sizeof(float));
     float *hidden2 = (float *)malloc(BATCH_SIZE * HIDDEN2_SIZE * sizeof(float));
@@ -252,7 +277,7 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train) {
             total_loss += loss;
 
             // Check prediction accuracy
-            correct += checkPredictions(output, y_train, start_idx, BATCH_SIZE, OUTPUT_SIZE);
+            correct += checkPredictions(output, &y_train[start_idx], BATCH_SIZE, OUTPUT_SIZE);
 
             // Backpropagation
             memset(nn->grad_weights_input_hidden1, 0, HIDDEN1_SIZE * INPUT_SIZE * sizeof(float));
@@ -265,13 +290,7 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train) {
             start = clock();
             float *grad_out = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
             // Compute gradient at output layer
-            for (int b = 0; b < BATCH_SIZE; b++) {
-                for (int i = 0; i < OUTPUT_SIZE; i++) {
-                  int idx=b * OUTPUT_SIZE + i;
-                    grad_out[idx] = output[idx] - (i == y_train[start_idx + b] ?  1.0f : 0.0f);
-                }
-            }
-            
+            compute_output_gradient(grad_out, output, &y_train[start_idx], BATCH_SIZE, OUTPUT_SIZE);            
             // Compute gradients for weights and biases between Hidden2 -> Output
             compute_gradients(hidden2, grad_out, nn->grad_weights_hidden2_output, nn->grad_bias_output, BATCH_SIZE, HIDDEN2_SIZE, OUTPUT_SIZE);
             end = clock();
@@ -314,8 +333,8 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train) {
         printf("Epoch %d/%d completed, Loss: %.4f, Accuracy: %.2f%%\n",
                epoch + 1, EPOCHS, total_loss / num_batches, 100.0f * correct / TRAIN_DATA_SIZE);
 
-        printf("    Layer 1 time: %.6f seconds\n", layer1_time);
-        printf("    Layer 2 time: %.6f seconds\n", layer2_time);
+        printf("    Layer 1 time: %.6f seconds", layer1_time);
+        printf("    Layer 2 time: %.6f seconds", layer2_time);
         printf("    Output layer time: %.6f seconds\n", output_time);
     }
 
@@ -347,7 +366,7 @@ void test(NeuralNetwork *nn, float *X_test, int *y_test) {
         softmax(output, BATCH_SIZE, OUTPUT_SIZE);
 
         // Kiểm tra kết quả dự đoán
-        correct += checkPredictions(output, y_test, start_idx, BATCH_SIZE, OUTPUT_SIZE);
+        correct += checkPredictions(output, &y_test[start_idx], BATCH_SIZE, OUTPUT_SIZE);
     }
 
     float accuracy = 100.0f * correct / TEST_DATA_SIZE;
