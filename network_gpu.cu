@@ -215,7 +215,7 @@ __global__ void matrix_multiplication_kernel1(float* A, float* B, float* C, int 
 
 __global__ void matrix_multiplication_kernel2(float* A, float* B, float* C, int m, int n, int k)
 {
-	  __shared__ float s_A[TILE_WIDTH][TILE_WIDTH];
+	__shared__ float s_A[TILE_WIDTH][TILE_WIDTH];
     __shared__ float s_B[TILE_WIDTH][TILE_WIDTH];
 
     int bx = blockIdx.x;
@@ -253,12 +253,10 @@ __global__ void matrix_multiplication_kernel2(float* A, float* B, float* C, int 
     }
 }
 // CUDA kernel for bias addition
-__global__ void bias_add_kernel(float *x, float *bias, int batch_size, int size) {
+__global__ void bias_forward_kernel(float *x, float *bias, int batch_size, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int b = idx / size;
-    int i = idx % size;
-
-    if (b < batch_size && i < size) {
+    if (idx < batch_size * size) {
+        int i = idx % size;
         x[idx] += bias[i];
     }
 }
@@ -270,18 +268,19 @@ __global__ void relu_kernel(float *x, int size) {
 }
 
 __global__ void forwardLayerKernel(float *input, float *weights, float *bias, float *output, int input_size, int output_size, int batch_size, bool use_relu) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < batch_size * output_size) {
-        int b = idx / output_size;
-        int j = idx % output_size;
-        output[idx] = 0.0f;
-        for (int k = 0; k < input_size; k++) {
-            output[idx] += input[b * input_size + k] * weights[k * output_size + j];
+    int batch_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    int output_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (batch_idx < batch_size && output_idx < output_size) {
+        float value = 0;
+        for (int i = 0; i < input_size; ++i) {
+            value += input[batch_idx * input_size + i] * weights[i * output_size + output_idx];
         }
-        output[idx] = output[idx] + bias[j];
+        value += bias[output_idx];
         if (use_relu) {
-            output[idx] = fmaxf(0.0f, output[idx]);
+            value = fmaxf(0.0f, value);
         }
+        output[batch_idx * output_size + output_idx] = value;
     }
 }
 __global__ void compute_gradients_kernel(float *input, float *delta, float *grad_weights, float *grad_bias, int batch_size, int input_size, int output_size) {
@@ -396,7 +395,7 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train, int version) {
 
     int num_batches = TRAIN_DATA_SIZE / BATCH_SIZE;
     // Define CUDA kernel dimensions
-    dim3 blockDim(TILE_WIDTH, TILE_WIDTH);
+    dim3 blockDim(32, 32);
 
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         float total_loss = 0.0f;
@@ -411,8 +410,8 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train, int version) {
               dim3 gridDim((HIDDEN1_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
               GpuTimer timer1;
               timer1.Start();
-              matrix_multiplication_kernel1<<<gridDim, blockDim>>>(d_X_train, nn->weights_input_hidden1, d_hidden1, BATCH_SIZE, INPUT_SIZE, HIDDEN1_SIZE);
-              bias_add_kernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_hidden1, nn->bias_hidden1, BATCH_SIZE, HIDDEN1_SIZE);
+              matrix_multiplication_kernel1<<<gridDim, blockDim>>>(d_X_train + start_idx * INPUT_SIZE, nn->weights_input_hidden1, d_hidden1, BATCH_SIZE, INPUT_SIZE, HIDDEN1_SIZE);
+              bias_forward_kernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_hidden1, nn->bias_hidden1, BATCH_SIZE, HIDDEN1_SIZE);
               relu_kernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_hidden1, BATCH_SIZE * HIDDEN1_SIZE);
               timer1.Stop();
               total_layer1_time += timer1.Elapsed();
@@ -422,7 +421,7 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train, int version) {
               GpuTimer timer2;
               timer2.Start();
               matrix_multiplication_kernel1<<<gridDim2, blockDim>>>(d_hidden1, nn->weights_hidden1_hidden2, d_hidden2, BATCH_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE);
-              bias_add_kernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_hidden2, nn->bias_hidden2, BATCH_SIZE, HIDDEN2_SIZE);
+              bias_forward_kernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_hidden2, nn->bias_hidden2, BATCH_SIZE, HIDDEN2_SIZE);
               relu_kernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_hidden2, BATCH_SIZE * HIDDEN2_SIZE);
               timer2.Stop();
               total_layer2_time += timer2.Elapsed();
@@ -433,7 +432,7 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train, int version) {
               GpuTimer timer3;
               timer3.Start();
               matrix_multiplication_kernel1<<<gridDim3, blockDim>>>(d_hidden2, nn->weights_hidden2_output, d_output, BATCH_SIZE, HIDDEN2_SIZE, OUTPUT_SIZE);
-              bias_add_kernel<<<(BATCH_SIZE * OUTPUT_SIZE + 255) / 256, 256>>>(d_output, nn->bias_output, BATCH_SIZE, OUTPUT_SIZE);
+              bias_forward_kernel<<<(BATCH_SIZE * OUTPUT_SIZE + 255) / 256, 256>>>(d_output, nn->bias_output, BATCH_SIZE, OUTPUT_SIZE);
 
               // Apply softmax on the output layer
               softmax_kernel<<<(BATCH_SIZE + 31) / 32, 32>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
@@ -442,33 +441,67 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train, int version) {
             }
             else if(version==1)
             {
-
-            }
-            else{
-              // Forward pass for layer 1
+                // Forward pass for layer 1
+              dim3 gridDim((HIDDEN1_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
               GpuTimer timer1;
               timer1.Start();
-              forwardLayerKernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255)/256, 256>>>(d_X_train + start_idx * INPUT_SIZE, nn->weights_input_hidden1, nn->bias_hidden1, d_hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
+              matrix_multiplication_kernel2<<<gridDim, blockDim>>>(d_X_train + start_idx * INPUT_SIZE, nn->weights_input_hidden1, d_hidden1, BATCH_SIZE, INPUT_SIZE, HIDDEN1_SIZE);
+              bias_forward_kernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_hidden1, nn->bias_hidden1, BATCH_SIZE, HIDDEN1_SIZE);
+              relu_kernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255) / 256, 256>>>(d_hidden1, BATCH_SIZE * HIDDEN1_SIZE);
               timer1.Stop();
               total_layer1_time += timer1.Elapsed();
-
+              
               // Forward pass for layer 2
+              dim3 gridDim2((HIDDEN2_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
               GpuTimer timer2;
               timer2.Start();
-              forwardLayerKernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255)/256, 256>>>(d_hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, d_hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
+              matrix_multiplication_kernel2<<<gridDim2, blockDim>>>(d_hidden1, nn->weights_hidden1_hidden2, d_hidden2, BATCH_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE);
+              bias_forward_kernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_hidden2, nn->bias_hidden2, BATCH_SIZE, HIDDEN2_SIZE);
+              relu_kernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255) / 256, 256>>>(d_hidden2, BATCH_SIZE * HIDDEN2_SIZE);
               timer2.Stop();
               total_layer2_time += timer2.Elapsed();
 
               // Forward pass for output layer
+              dim3 gridDim3((OUTPUT_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
+
               GpuTimer timer3;
               timer3.Start();
-              forwardLayerKernel<<<(BATCH_SIZE* OUTPUT_SIZE + 255)/256, 256>>>(d_hidden2, nn->weights_hidden2_output, nn->bias_output, d_output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
+              matrix_multiplication_kernel2<<<gridDim3, blockDim>>>(d_hidden2, nn->weights_hidden2_output, d_output, BATCH_SIZE, HIDDEN2_SIZE, OUTPUT_SIZE);
+              bias_forward_kernel<<<(BATCH_SIZE * OUTPUT_SIZE + 255) / 256, 256>>>(d_output, nn->bias_output, BATCH_SIZE, OUTPUT_SIZE);
+
+              // Apply softmax on the output layer
               softmax_kernel<<<(BATCH_SIZE + 31) / 32, 32>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
               timer3.Stop();
               total_output_time += timer3.Elapsed();
             }
-            CHECK(cudaMemcpy(output, d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+            else{
+              // Forward pass for layer 1
+               dim3 gridDim((HIDDEN1_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
+              GpuTimer timer1;
+              timer1.Start();
+              forwardLayerKernel<<<gridDim, blockDim>>>(d_X_train + start_idx * INPUT_SIZE, nn->weights_input_hidden1, nn->bias_hidden1, d_hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
+              timer1.Stop();
+              total_layer1_time += timer1.Elapsed();
 
+              // Forward pass for layer 2
+              dim3 gridDim2((HIDDEN2_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
+              GpuTimer timer2;
+              timer2.Start();
+              forwardLayerKernel<<<gridDim2, blockDim>>>(d_hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, d_hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
+              timer2.Stop();
+              total_layer2_time += timer2.Elapsed();
+
+              // Forward pass for output layer
+              dim3 gridDim3((OUTPUT_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
+              GpuTimer timer3;
+              timer3.Start();
+              forwardLayerKernel<<<gridDim3, blockDim>>>(d_hidden2, nn->weights_hidden2_output, nn->bias_output, d_output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
+              softmax_kernel<<<(BATCH_SIZE + 31) / 32, 32>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
+              timer3.Stop();
+              total_output_time += timer3.Elapsed();
+            }
+            
+            CHECK(cudaMemcpy(output, d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
             float loss = compute_loss(output, &y_train[start_idx], BATCH_SIZE);
             total_loss += loss;
             // Check prediction accuracy
@@ -512,9 +545,10 @@ void train(NeuralNetwork *nn, float *X_train, int *y_train, int version) {
 
         printf("Epoch %d/%d completed, Loss: %.4f, Accuracy: %.2f%%\n", epoch + 1, EPOCHS, total_loss / num_batches, 100.0f * correct / TRAIN_DATA_SIZE);
         
-        printf("    Total Layer 1 time: %.6f s\n", total_layer1_time/1000);
-        printf("    Total Layer 2 time: %.6f s\n", total_layer2_time/1000);
-        printf("    Total Output layer time: %.6f s\n", total_output_time/1000); }
+        printf("    Layer 1 time: %.6f s", total_layer1_time/1000);
+        printf("    Layer 2 time: %.6f s", total_layer2_time/1000);
+        printf("    Output layer time: %.6f s\n", total_output_time/1000);
+    }
 
     free(hidden1);
     free(hidden2);
@@ -539,24 +573,29 @@ void test(NeuralNetwork *nn, float *X_test, int *y_test) {
 
     int num_batches = TEST_DATA_SIZE / BATCH_SIZE;
     int correct = 0;
-
+    // Define CUDA kernel dimensions
+    dim3 blockDim(32, 32);
     for (int batch = 0; batch < num_batches; batch++) {
         int start_idx = batch * BATCH_SIZE;
 
         // Forward pass for layer 1
-        forwardLayerKernel<<<(BATCH_SIZE * HIDDEN1_SIZE + 255)/256, 256>>>(d_X_test + start_idx * INPUT_SIZE, nn->weights_input_hidden1, nn->bias_hidden1, d_hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
+       dim3 gridDim((HIDDEN1_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
 
-        // Forward pass for layer 2
-        forwardLayerKernel<<<(BATCH_SIZE * HIDDEN2_SIZE + 255)/256, 256>>>(d_hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, d_hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
+      forwardLayerKernel<<<gridDim, blockDim>>>(d_X_train + start_idx * INPUT_SIZE, nn->weights_input_hidden1, nn->bias_hidden1, d_hidden1, INPUT_SIZE, HIDDEN1_SIZE, BATCH_SIZE, true);
 
-        // Forward pass for output layer
-        forwardLayerKernel<<<(BATCH_SIZE * OUTPUT_SIZE + 255)/256, 256>>>(d_hidden2, nn->weights_hidden2_output, nn->bias_output, d_output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
+      // Forward pass for layer 2
+      dim3 gridDim2((HIDDEN2_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
 
-        // Apply softmax
-        softmax_kernel<<<BATCH_SIZE, 1>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
+      forwardLayerKernel<<<gridDim2, blockDim>>>(d_hidden1, nn->weights_hidden1_hidden2, nn->bias_hidden2, d_hidden2, HIDDEN1_SIZE, HIDDEN2_SIZE, BATCH_SIZE, true);
 
-        float *output = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
-        CHECK(cudaMemcpy(output, d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
+      // Forward pass for output layer
+      dim3 gridDim3((OUTPUT_SIZE + blockDim.x - 1) / blockDim.x, (BATCH_SIZE + blockDim.y - 1) / blockDim.y);
+
+      forwardLayerKernel<<<gridDim3, blockDim>>>(d_hidden2, nn->weights_hidden2_output, nn->bias_output, d_output, HIDDEN2_SIZE, OUTPUT_SIZE, BATCH_SIZE, false);
+      softmax_kernel<<<(BATCH_SIZE + 31) / 32, 32>>>(d_output, BATCH_SIZE, OUTPUT_SIZE);
+
+float *output = (float *)malloc(BATCH_SIZE * OUTPUT_SIZE * sizeof(float));
+CHECK(cudaMemcpy(output, d_output, BATCH_SIZE * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost));
 
         // Kiểm tra kết quả dự đoán
         correct += checkPredictions(output, &y_test[start_idx], BATCH_SIZE, OUTPUT_SIZE);
@@ -603,6 +642,7 @@ int main(int argc, char **argv) {
     load_data("x_test.bin", X_test, TEST_DATA_SIZE * INPUT_SIZE);
     load_labels("y_test.bin", y_test, TEST_DATA_SIZE);
     NeuralNetwork nn;
+    printf("\nBasic GPU kernel \n");
     initialize_neural_network(&nn);
     // Training
     train(&nn, X_train, y_train, 0);
@@ -610,11 +650,21 @@ int main(int argc, char **argv) {
     // Testing
     test(&nn, X_test, y_test);  
     freeNN(&nn);
-
+    printf("==============================\n");
+    
+    printf("TiledMatrixMultiplication sử dụng shared memory \n");
+    initialize_neural_network(&nn);
+    // Training
+    train(&nn, X_train, y_train, 1);
+    // Testing
+    test(&nn, X_test, y_test);  
+    freeNN(&nn);
+    printf("==============================\n");
+    
+    printf("Kernel fusion for add bias, relu and matrix-multiplication\n");
     initialize_neural_network(&nn);
     // Training
     train(&nn, X_train, y_train, 2);
-
     // Testing
     test(&nn, X_test, y_test);  
     freeNN(&nn);
